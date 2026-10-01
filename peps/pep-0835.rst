@@ -37,8 +37,8 @@ However, its verbosity remains a barrier to adoption:
    code unreadable, contributing to the PEP's withdrawal [5]_.
 
 Of the 10,000 most downloaded PyPI projects, **43.4%** transitively depend on
-``Annotated``. Migrating the FastAPI codebase to the new shorthand removed
-2,524 LOCs.
+a package utilizing ``typing.Annotated``. Migrating the FastAPI codebase to the
+new shorthand removed 2,524 LOCs.
 
 A container-like syntax opposes Python's evolution. Python is actively replacing
 generic wrappers like ``typing.Union`` with operators like ``|`` (and the
@@ -52,7 +52,7 @@ postfix operator, it:
 - **Reduces tokens** (no ``typing.Annotated`` import).
 - **Improves locality** (the base type remains front-and-center).
 - **Extends the arithmetic of types** (type metadata acts as an operation on an
-  existing type expression rather than a generic container).
+  existing annotation expression rather than a generic container).
 
 This resolves the conflict between concise syntax and strict typing::
 
@@ -114,12 +114,12 @@ apply:
   that evaluates to a valid type, as specified in the `Typing Specification
   <https://typing.python.org/en/latest/spec/annotations.html#type-and-annotation-expressions>`__
   (:pep:`484`).
-- **Type metadata**: e.g., ``int @ <this>``. Data attached to a type expression
-  via ``Annotated`` (:pep:`593`, :pep:`746`).
+- **Type metadata**: e.g., ``int @ <this>``. Data attached to an annotation
+  expression via ``Annotated`` (:pep:`593`, :pep:`746`).
 - **Non-typing annotation**: e.g., `@no_type_check
   <https://docs.python.org/3/library/typing.html#typing.no_type_check>`__
   wrapping ``x: <this>``. Annotations that are not intended to be evaluated as
-  type expressions (e.g.: ignored by type checkers).
+  annotation expressions (e.g.: ignored by type checkers).
 - **Symbol decorator**: Applying metadata directly to a variable or field
   declaration, rather than to its underlying type. This distinction is
   well-established in languages like Java:
@@ -236,29 +236,40 @@ will raise a ``TypeError`` at runtime.
 
 To support this safely at runtime, library authors are encouraged to implement
 ``__rmatmul__`` on their metadata objects. This provides a robust fallback for
-types that do not invoke ``__matmul__`` on the left operand (such as
-``NoneType`` or ``ForwardRef``).
+types that do not natively invoke ``__matmul__`` on the left operand (such as
+``NoneType``). (Note: while ``typing.ForwardRef`` implements ``__matmul__``,
+``annotationlib`` does not invoke it; it evaluates strings using proxy types
+and then replaces them with ``ForwardRef`` instances in a second pass).
 
 Supported Left-Hand Operands
 -----------------------------
 
-The ``@`` operator adds ``nb_matrix_multiply`` to ``type`` and to all typing
+The ``@`` operator adds ``nb_matrix_multiply`` to ``type`` and to typing
 constructs that support the ``|`` union operator (``types.GenericAlias``,
-``types.UnionType``, ``types.AnnotatedType``, ``typing.TypeVar``,
-``typing.ParamSpec``, ``typing.TypeVarTuple``, ``typing.TypeAliasType``,
-``typing.ForwardRef``, and ``sentinel`` objects).
+``types.UnionType``, ``typing.Annotated``, ``typing.TypeVar``,
+``typing.ParamSpec``, ``typing.ParamSpecArgs``, ``typing.ParamSpecKwargs``,
+``typing.TypeAliasType``, ``typing.ForwardRef``, ``dataclasses.InitVar``,
+and ``sentinel`` objects).
 
 Applying ``@`` to a class evaluates as type metadata; applying it to an instance
 performs arithmetic.
 
-For example, ``int @ Field()`` produces an ``AnnotatedType``, while ``42 @
+For example, ``int @ Field()`` produces a ``typing.Annotated`` type, while ``42 @
 something`` raises a ``TypeError`` (or delegates to ``__rmatmul__``).
 
-Likewise, ``ndarray @ Field()`` produces an ``AnnotatedType``, even though
+Likewise, ``ndarray @ Field()`` produces a ``typing.Annotated`` type, even though
 ``ndarray`` instances define ``__matmul__`` for matrix multiplication.
 
 Custom metaclasses can overload ``__matmul__`` provided ``@`` is avoided in type
 expressions.
+
+C Implementation
+----------------
+
+The ``@`` operator evaluates to a ``types.AnnotatedType`` object natively
+implemented in C. Similar to ``types.UnionType`` (created via ``|``) mapping
+to ``typing.Union``, ``types.AnnotatedType`` acts as the underlying object but
+is fully compatible with and exposes itself publicly as ``typing.Annotated``.
 
 
 Rationale
@@ -497,10 +508,11 @@ We explicitly reject relying *solely* on metadata objects implementing
         ...
 
 This approach is rejected for two reasons. First, relying on arbitrary
-right-hand objects to implement ``__rmatmul__`` breaks the type expression
-model, complicating the assignment of fixed static meanings to operators. This
-is inconsistent with how ``|`` works and contradicts the type expression grammar
-defined in the specification. Second, :pep:`593` explicitly permits any valid
+right-hand objects to implement ``__rmatmul__`` breaks the annotation
+expression model, complicating the assignment of fixed static meanings to
+operators. This is inconsistent with how ``|`` works and contradicts the
+annotation expression grammar defined in the specification. Second, :pep:`593`
+explicitly permits any valid
 Python object as metadata (e.g., strings, dicts). Implementing ``__matmul__``
 directly on the ``type`` metaclass avoids opt-in base classes and provides
 consistent behavior.
@@ -510,14 +522,14 @@ Parameter/Field Decorators
 
 True parameter/field decorators were rejected for now. Modifying the core parser
 for symbol-level decorators opens a complex design space; this PEP scopes the
-``@`` operator to type expressions.
+``@`` operator to annotation expressions.
 
 Avoiding @ Due to Matrix Multiplication
 ---------------------------------------
 
 We rejected the argument that ``@`` should be avoided because of its association
-with matrix multiplication. Within a type expression, Python already reuses
-standard operators (like ``|`` for unions and ``[]`` for generics) with
+with matrix multiplication. Within an annotation expression, Python already
+reuses standard operators (like ``|`` for unions and ``[]`` for generics) with
 typing-specific semantics (see `Why the @ Operator?`_).
 
 Structural Evaluation Format (``Format.TYPE``)
@@ -530,6 +542,15 @@ structurally evaluate the ``@`` operator and preserve metadata on unresolvable
 This was rejected. Prototype integrations (``beartype``, ``pydantic``,
 ``fastapi``, ``sqlalchemy``, and ``hypothesis``) showed the existing ecosystem
 handles the ``@`` operator using ``annotationlib``'s current tools.
+
+However, we acknowledge a tradeoff: evaluating undefined annotations with
+``Format.FORWARDREF`` now produces an opaque ``ForwardRef("undefined @
+'metadata'")``. This makes it harder to extract metadata than with
+``Annotated`` (where ``get_args()`` yields ``(ForwardRef("undefined"),
+'metadata')``). Despite this regression, we found no breakage in our prototype
+migrations, indicating that runtime tools generally depend on successful type
+resolution or structural evaluation rather than raw forward reference strings.
+This is further mitigated by adding ``__rmatmul__`` on annotation classes.
 
 No-Space Formatting (``@annot``)
 --------------------------------
